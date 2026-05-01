@@ -18,7 +18,21 @@ const (
 	runDuration = 15 * time.Minute
 	emaFast     = 3
 	emaSlow     = 7
+	feeRate     = 0.001
 )
+
+type Trade struct {
+	num        int
+	entryTime  time.Time
+	exitTime   time.Time
+	entryPrice float64
+	exitPrice  float64
+	qty        float64
+	spent      float64
+	gross      float64
+	fee        float64
+	net        float64
+}
 
 func main() {
 	apiKey := os.Getenv("BYBIT_API_KEY")
@@ -48,8 +62,11 @@ func main() {
 		inPosition bool
 		btcHeld    float64
 		entryPrice float64
-		trades     int
+		entryTime  time.Time
+		spentUSDT  float64
+		tradeCount int
 		totalPnL   float64
+		history    []Trade
 	)
 
 	deadline := time.Now().Add(runDuration)
@@ -92,42 +109,76 @@ func main() {
 
 			unrealized := 0.0
 			if inPosition && btcHeld > 0 {
-				unrealized = (price - entryPrice) * btcHeld
+				gross := (price - entryPrice) * btcHeld
+				fee := spentUSDT*feeRate + price*btcHeld*feeRate
+				unrealized = gross - fee
 			}
 
-			fmt.Printf("[%s] price=%.2f  EMA%d=%.2f  EMA%d=%.2f  pos=%v  unreal=%.2f  remain=%s\n",
+			fmt.Printf("[%s] price=%.2f  EMA%d=%.2f  EMA%d=%.2f  pos=%v  unreal=%+.2f  remain=%s\n",
 				now.Format("15:04:05"), price, emaFast, fast, emaSlow, slow,
 				inPosition, unrealized, remaining)
 
 			if crossUp && !inPosition {
 				usdtBalance, _ := client.GetCoinBalance("USDT")
 				spend := usdtBalance * riskPct
-				fmt.Printf("  → BUY SIGNAL  spending=%.2f USDT\n", spend)
+				fmt.Printf("  ┌─ BUY SIGNAL ─────────────────────────\n")
+				fmt.Printf("  │  balance=%.2f USDT  spending=%.2f USDT\n", usdtBalance, spend)
 
 				orderID, err := client.MarketBuy(symbol, spend)
 				if err != nil {
-					fmt.Printf("  [ERR] buy failed: %v\n", err)
+					fmt.Printf("  └─ [ERR] buy failed: %v\n", err)
 				} else {
 					time.Sleep(2 * time.Second)
 					btcHeld, _ = client.GetCoinBalance("BTC")
 					entryPrice = price
+					entryTime = now
+					spentUSDT = spend
 					inPosition = true
-					trades++
-					fmt.Printf("  ✓ BUY  orderID=%s  btc=%.5f  entry=%.2f\n", orderID, btcHeld, entryPrice)
+					tradeCount++
+					fmt.Printf("  └─ ✓ BUY #%d  entry=%.2f  qty=%.5f BTC  cost=%.2f USDT\n",
+						tradeCount, entryPrice, btcHeld, spend)
+					fmt.Printf("       orderID=%s\n", orderID)
 				}
 
 			} else if crossDown && inPosition {
-				fmt.Printf("  → SELL SIGNAL  btc=%.5f\n", btcHeld)
+				fmt.Printf("  ┌─ SELL SIGNAL ─────────────────────────\n")
+				fmt.Printf("  │  btc=%.5f  entry=%.2f  now=%.2f\n", btcHeld, entryPrice, price)
 				sellQty, _ := client.GetCoinBalance("BTC")
 				orderID, err := client.MarketSell(symbol, sellQty)
 				if err != nil {
-					fmt.Printf("  [ERR] sell failed: %v\n", err)
+					fmt.Printf("  └─ [ERR] sell failed: %v\n", err)
 				} else {
-					pnl := (price - entryPrice) * btcHeld
-					totalPnL += pnl
+					gross := (price - entryPrice) * btcHeld
+					fee := spentUSDT*feeRate + price*btcHeld*feeRate
+					net := gross - fee
+					pricePct := (price - entryPrice) / entryPrice * 100
+					feePct := fee / spentUSDT * 100
+					dur := now.Sub(entryTime).Round(time.Second)
+					totalPnL += net
+
+					history = append(history, Trade{
+						num:        tradeCount,
+						entryTime:  entryTime,
+						exitTime:   now,
+						entryPrice: entryPrice,
+						exitPrice:  price,
+						qty:        btcHeld,
+						spent:      spentUSDT,
+						gross:      gross,
+						fee:        fee,
+						net:        net,
+					})
+
+					fmt.Printf("  └─ ✓ SELL #%d  exit=%.2f  Δprice=%+.2f%%  held=%s\n",
+						tradeCount, price, pricePct, dur)
+					fmt.Printf("       gross=%+.2f USDT  fee=%.2f(%.2f%%)  net=%+.2f USDT\n",
+						gross, fee, feePct, net)
+					fmt.Printf("       cumulative P&L: %+.2f USDT\n", totalPnL)
+					fmt.Printf("       orderID=%s\n", orderID)
+
 					inPosition = false
-					fmt.Printf("  ✓ SELL  orderID=%s  pnl=%.2f USDT  totalPnL=%.2f\n", orderID, pnl, totalPnL)
 					btcHeld = 0
+					spentUSDT = 0
 				}
 			}
 
@@ -151,9 +202,28 @@ exit:
 				fmt.Printf("[ERR] final sell: %v\n", err)
 			} else {
 				price, _ := client.GetLastPrice(symbol)
-				pnl := (price - entryPrice) * btcNow
-				totalPnL += pnl
-				fmt.Printf("✓ Final SELL  orderID=%s  pnl=%.2f\n", orderID, pnl)
+				gross := (price - entryPrice) * btcNow
+				fee := spentUSDT*feeRate + price*btcNow*feeRate
+				net := gross - fee
+				pricePct := (price - entryPrice) / entryPrice * 100
+				dur := time.Since(entryTime).Round(time.Second)
+				totalPnL += net
+
+				history = append(history, Trade{
+					num:        tradeCount,
+					entryTime:  entryTime,
+					exitTime:   time.Now(),
+					entryPrice: entryPrice,
+					exitPrice:  price,
+					qty:        btcNow,
+					spent:      spentUSDT,
+					gross:      gross,
+					fee:        fee,
+					net:        net,
+				})
+
+				fmt.Printf("✓ Final SELL  Δprice=%+.2f%%  held=%s  net=%+.2f USDT  orderID=%s\n",
+					pricePct, dur, net, orderID)
 			}
 		}
 	}
@@ -161,14 +231,76 @@ exit:
 	time.Sleep(2 * time.Second)
 	endUSDT, _ := client.GetCoinBalance("USDT")
 
-	fmt.Printf("\n╔══════════════════════════════════════╗\n")
-	fmt.Printf("║              RESULTS                 ║\n")
-	fmt.Printf("╠══════════════════════════════════════╣\n")
-	fmt.Printf("║  Start:   %10.2f USDT             ║\n", startUSDT)
-	fmt.Printf("║  End:     %10.2f USDT             ║\n", endUSDT)
-	fmt.Printf("║  P&L:     %+10.2f USDT             ║\n", endUSDT-startUSDT)
-	fmt.Printf("║  Trades:  %d                          ║\n", trades)
-	fmt.Printf("╚══════════════════════════════════════╝\n")
+	printSummary(startUSDT, endUSDT, totalPnL, tradeCount, history)
+}
+
+func printSummary(startUSDT, endUSDT, totalPnL float64, tradeCount int, history []Trade) {
+	sep := "─────────────────────────────────────────────────────────────────────────────"
+
+	fmt.Printf("\n%s\n", sep)
+	fmt.Printf("  TRADE HISTORY\n")
+	fmt.Printf("%s\n", sep)
+	fmt.Printf("  %-3s  %-10s  %-10s  %-9s  %-9s  %-9s  %-12s  %-9s  %s\n",
+		"#", "Entry", "Exit", "Δ price", "Qty BTC", "Gross", "Fee (USDT%)", "Net", "Held")
+	fmt.Printf("%s\n", sep)
+
+	wins := 0
+	totalFee := 0.0
+	bestNet := 0.0
+	worstNet := 0.0
+
+	for i, t := range history {
+		dur := t.exitTime.Sub(t.entryTime).Round(time.Second)
+		pct := (t.exitPrice - t.entryPrice) / t.entryPrice * 100
+		feePct := t.fee / t.spent * 100
+		totalFee += t.fee
+
+		if t.net > 0 {
+			wins++
+		}
+		if i == 0 || t.net > bestNet {
+			bestNet = t.net
+		}
+		if i == 0 || t.net < worstNet {
+			worstNet = t.net
+		}
+
+		fmt.Printf("  %-3d  %-10.2f  %-10.2f  %+8.2f%%  %-9.5f  %+8.2f  %6.2f(%.2f%%)  %+8.2f  %s\n",
+			t.num,
+			t.entryPrice, t.exitPrice,
+			pct,
+			t.qty,
+			t.gross,
+			t.fee, feePct,
+			t.net,
+			dur,
+		)
+	}
+
+	if len(history) == 0 {
+		fmt.Printf("  (no closed trades)\n")
+	}
+
+	winRate := 0.0
+	if len(history) > 0 {
+		winRate = float64(wins) / float64(len(history)) * 100
+	}
+
+	fmt.Printf("%s\n", sep)
+	fmt.Printf("  RESULTS\n")
+	fmt.Printf("%s\n", sep)
+	fmt.Printf("  Balance start   : %10.2f USDT\n", startUSDT)
+	fmt.Printf("  Balance end     : %10.2f USDT\n", endUSDT)
+	fmt.Printf("  Net P&L         : %+10.2f USDT\n", endUSDT-startUSDT)
+	fmt.Printf("  Realized P&L    : %+10.2f USDT\n", totalPnL)
+	fmt.Printf("  Total fees paid : %10.2f USDT\n", totalFee)
+	fmt.Printf("  Trades opened   : %d\n", tradeCount)
+	fmt.Printf("  Trades closed   : %d  wins=%d  win rate=%.0f%%\n", len(history), wins, winRate)
+	if len(history) > 0 {
+		fmt.Printf("  Best trade      : %+10.2f USDT\n", bestNet)
+		fmt.Printf("  Worst trade     : %+10.2f USDT\n", worstNet)
+	}
+	fmt.Printf("%s\n\n", sep)
 }
 
 func calcEMA(data []float64, period int) float64 {
