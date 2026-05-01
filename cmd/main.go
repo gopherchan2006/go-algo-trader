@@ -13,13 +13,12 @@ import (
 )
 
 const (
-	symbol      = "BTCUSDT"
-	riskPct     = 0.20
-	pollEvery   = 15 * time.Second
-	runDuration = 15 * time.Minute
-	emaFast     = 3
-	emaSlow     = 7
-	feeRate     = 0.001
+	symbol    = "BTCUSDT"
+	riskPct   = 0.20
+	pollEvery = 15 * time.Second
+	emaFast   = 3
+	emaSlow   = 7
+	feeRate   = 0.001
 )
 
 type Trade struct {
@@ -62,11 +61,11 @@ func main() {
 
 	fmt.Printf("\n╔══════════════════════════════════════╗\n")
 	fmt.Printf("║  go-algo-trader  |  EMA %d/%d momentum  ║\n", emaFast, emaSlow)
-	fmt.Printf("║  symbol=%-8s  risk=%.0f%%  run=15m   ║\n", symbol, riskPct*100)
+	fmt.Printf("║  symbol=%-8s  risk=%.0f%%  run=24/7  ║\n", symbol, riskPct*100)
 	fmt.Printf("╚══════════════════════════════════════╝\n")
 	fmt.Printf("  Starting balance: %.2f USDT\n\n", startUSDT)
 
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(runDuration))
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	quit := make(chan os.Signal, 1)
@@ -116,22 +115,16 @@ func main() {
 func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCount int, totalPnL float64, history []Trade) {
 	var prices []float64
 
-	deadline, _ := ctx.Deadline()
-
 	ticker := time.NewTicker(pollEvery)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			if ctx.Err() == context.DeadlineExceeded {
-				fmt.Println("\n[!] 15 minutes elapsed — closing position if open...")
-			}
 			return
 
 		case <-ticker.C:
 			now := time.Now()
-			remaining := time.Until(deadline).Round(time.Second)
 
 			price, err := client.GetLastPrice(symbol)
 			if err != nil {
@@ -161,9 +154,9 @@ func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCoun
 				unrealized = gross - fee
 			}
 
-			fmt.Printf("[%s] price=%.2f  EMA%d=%.2f  EMA%d=%.2f  pos=%v  unreal=%+.2f  remain=%s\n",
+			fmt.Printf("[%s] price=%.2f  EMA%d=%.2f  EMA%d=%.2f  pos=%v  unreal=%+.2f\n",
 				now.Format("15:04:05"), price, emaFast, fast, emaSlow, slow,
-				pos.active, unrealized, remaining)
+				pos.active, unrealized)
 
 			if crossUp && !pos.active {
 				usdtBalance, _ := client.GetCoinBalance("USDT")
