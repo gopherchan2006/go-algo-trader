@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -34,6 +35,14 @@ type Trade struct {
 	net        float64
 }
 
+type position struct {
+	active     bool
+	btcHeld    float64
+	entryPrice float64
+	entryTime  time.Time
+	spentUSDT  float64
+}
+
 func main() {
 	apiKey := os.Getenv("BYBIT_API_KEY")
 	secretKey := os.Getenv("BYBIT_SECRET_KEY")
@@ -57,30 +66,71 @@ func main() {
 	fmt.Printf("╚══════════════════════════════════════╝\n")
 	fmt.Printf("  Starting balance: %.2f USDT\n\n", startUSDT)
 
-	var (
-		prices     []float64
-		inPosition bool
-		btcHeld    float64
-		entryPrice float64
-		entryTime  time.Time
-		spentUSDT  float64
-		tradeCount int
-		totalPnL   float64
-		history    []Trade
-	)
-
-	deadline := time.Now().Add(runDuration)
-	ticker := time.NewTicker(pollEvery)
-	defer ticker.Stop()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(runDuration))
+	defer cancel()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-quit
+		fmt.Println("\n[!] Interrupted — closing position if open...")
+		cancel()
+	}()
+
+	pos, tradeCount, totalPnL, history := runLoop(ctx, client)
+
+	if pos.active && pos.btcHeld > 0 {
+		btcNow, _ := client.GetCoinBalance("BTC")
+		if btcNow > 0 {
+			orderID, err := client.MarketSell(symbol, btcNow)
+			if err != nil {
+				fmt.Printf("[ERR] final sell: %v\n", err)
+			} else {
+				price, _ := client.GetLastPrice(symbol)
+				gross := (price - pos.entryPrice) * btcNow
+				fee := pos.spentUSDT*feeRate + price*btcNow*feeRate
+				net := gross - fee
+				pricePct := (price - pos.entryPrice) / pos.entryPrice * 100
+				dur := time.Since(pos.entryTime).Round(time.Second)
+				totalPnL += net
+				history = append(history, Trade{
+					num:        tradeCount,
+					entryTime:  pos.entryTime,
+					exitTime:   time.Now(),
+					entryPrice: pos.entryPrice,
+					exitPrice:  price,
+					qty:        btcNow,
+					spent:      pos.spentUSDT,
+					gross:      gross,
+					fee:        fee,
+					net:        net,
+				})
+				fmt.Printf("✓ Final SELL  Δprice=%+.2f%%  held=%s  net=%+.2f USDT  orderID=%s\n",
+					pricePct, dur, net, orderID)
+			}
+		}
+	}
+
+	time.Sleep(2 * time.Second)
+	endUSDT, _ := client.GetCoinBalance("USDT")
+	printSummary(startUSDT, endUSDT, totalPnL, tradeCount, history)
+}
+
+func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCount int, totalPnL float64, history []Trade) {
+	var prices []float64
+
+	deadline, _ := ctx.Deadline()
+
+	ticker := time.NewTicker(pollEvery)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-quit:
-			fmt.Println("\n[!] Interrupted — closing position if open...")
-			goto exit
+		case <-ctx.Done():
+			if ctx.Err() == context.DeadlineExceeded {
+				fmt.Println("\n[!] 15 minutes elapsed — closing position if open...")
+			}
+			return
 
 		case <-ticker.C:
 			now := time.Now()
@@ -108,17 +158,17 @@ func main() {
 			crossDown := prevFast >= prevSlow && fast < slow
 
 			unrealized := 0.0
-			if inPosition && btcHeld > 0 {
-				gross := (price - entryPrice) * btcHeld
-				fee := spentUSDT*feeRate + price*btcHeld*feeRate
+			if pos.active && pos.btcHeld > 0 {
+				gross := (price - pos.entryPrice) * pos.btcHeld
+				fee := pos.spentUSDT*feeRate + price*pos.btcHeld*feeRate
 				unrealized = gross - fee
 			}
 
 			fmt.Printf("[%s] price=%.2f  EMA%d=%.2f  EMA%d=%.2f  pos=%v  unreal=%+.2f  remain=%s\n",
 				now.Format("15:04:05"), price, emaFast, fast, emaSlow, slow,
-				inPosition, unrealized, remaining)
+				pos.active, unrealized, remaining)
 
-			if crossUp && !inPosition {
+			if crossUp && !pos.active {
 				usdtBalance, _ := client.GetCoinBalance("USDT")
 				spend := usdtBalance * riskPct
 				fmt.Printf("  ┌─ BUY SIGNAL ─────────────────────────\n")
@@ -129,41 +179,45 @@ func main() {
 					fmt.Printf("  └─ [ERR] buy failed: %v\n", err)
 				} else {
 					time.Sleep(2 * time.Second)
-					btcHeld, _ = client.GetCoinBalance("BTC")
-					entryPrice = price
-					entryTime = now
-					spentUSDT = spend
-					inPosition = true
+					btcHeld, _ := client.GetCoinBalance("BTC")
 					tradeCount++
+					pos = position{
+						active:     true,
+						btcHeld:    btcHeld,
+						entryPrice: price,
+						entryTime:  now,
+						spentUSDT:  spend,
+					}
 					fmt.Printf("  └─ ✓ BUY #%d  entry=%.2f  qty=%.5f BTC  cost=%.2f USDT\n",
-						tradeCount, entryPrice, btcHeld, spend)
+						tradeCount, pos.entryPrice, pos.btcHeld, spend)
 					fmt.Printf("       orderID=%s\n", orderID)
 				}
 
-			} else if crossDown && inPosition {
+			} else if crossDown && pos.active {
 				fmt.Printf("  ┌─ SELL SIGNAL ─────────────────────────\n")
-				fmt.Printf("  │  btc=%.5f  entry=%.2f  now=%.2f\n", btcHeld, entryPrice, price)
+				fmt.Printf("  │  btc=%.5f  entry=%.2f  now=%.2f\n", pos.btcHeld, pos.entryPrice, price)
+
 				sellQty, _ := client.GetCoinBalance("BTC")
 				orderID, err := client.MarketSell(symbol, sellQty)
 				if err != nil {
 					fmt.Printf("  └─ [ERR] sell failed: %v\n", err)
 				} else {
-					gross := (price - entryPrice) * btcHeld
-					fee := spentUSDT*feeRate + price*btcHeld*feeRate
+					gross := (price - pos.entryPrice) * pos.btcHeld
+					fee := pos.spentUSDT*feeRate + price*pos.btcHeld*feeRate
 					net := gross - fee
-					pricePct := (price - entryPrice) / entryPrice * 100
-					feePct := fee / spentUSDT * 100
-					dur := now.Sub(entryTime).Round(time.Second)
+					pricePct := (price - pos.entryPrice) / pos.entryPrice * 100
+					feePct := fee / pos.spentUSDT * 100
+					dur := now.Sub(pos.entryTime).Round(time.Second)
 					totalPnL += net
 
 					history = append(history, Trade{
 						num:        tradeCount,
-						entryTime:  entryTime,
+						entryTime:  pos.entryTime,
 						exitTime:   now,
-						entryPrice: entryPrice,
+						entryPrice: pos.entryPrice,
 						exitPrice:  price,
-						qty:        btcHeld,
-						spent:      spentUSDT,
+						qty:        pos.btcHeld,
+						spent:      pos.spentUSDT,
 						gross:      gross,
 						fee:        fee,
 						net:        net,
@@ -176,15 +230,8 @@ func main() {
 					fmt.Printf("       cumulative P&L: %+.2f USDT\n", totalPnL)
 					fmt.Printf("       orderID=%s\n", orderID)
 
-					inPosition = false
-					btcHeld = 0
-					spentUSDT = 0
+					pos = position{}
 				}
-			}
-
-			if now.After(deadline) {
-				fmt.Println("\n[!] 15 minutes elapsed — closing position if open...")
-				goto exit
 			}
 
 			if len(prices) > 100 {
@@ -192,47 +239,8 @@ func main() {
 			}
 		}
 	}
-
-exit:
-	if inPosition && btcHeld > 0 {
-		btcNow, _ := client.GetCoinBalance("BTC")
-		if btcNow > 0 {
-			orderID, err := client.MarketSell(symbol, btcNow)
-			if err != nil {
-				fmt.Printf("[ERR] final sell: %v\n", err)
-			} else {
-				price, _ := client.GetLastPrice(symbol)
-				gross := (price - entryPrice) * btcNow
-				fee := spentUSDT*feeRate + price*btcNow*feeRate
-				net := gross - fee
-				pricePct := (price - entryPrice) / entryPrice * 100
-				dur := time.Since(entryTime).Round(time.Second)
-				totalPnL += net
-
-				history = append(history, Trade{
-					num:        tradeCount,
-					entryTime:  entryTime,
-					exitTime:   time.Now(),
-					entryPrice: entryPrice,
-					exitPrice:  price,
-					qty:        btcNow,
-					spent:      spentUSDT,
-					gross:      gross,
-					fee:        fee,
-					net:        net,
-				})
-
-				fmt.Printf("✓ Final SELL  Δprice=%+.2f%%  held=%s  net=%+.2f USDT  orderID=%s\n",
-					pricePct, dur, net, orderID)
-			}
-		}
-	}
-
-	time.Sleep(2 * time.Second)
-	endUSDT, _ := client.GetCoinBalance("USDT")
-
-	printSummary(startUSDT, endUSDT, totalPnL, tradeCount, history)
 }
+
 
 func printSummary(startUSDT, endUSDT, totalPnL float64, tradeCount int, history []Trade) {
 	sep := "─────────────────────────────────────────────────────────────────────────────"
