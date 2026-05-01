@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -118,17 +119,19 @@ func (c *Client) MarketBuy(symbol string, usdtAmount float64) (string, error) {
 	})
 }
 
-func (c *Client) MarketSell(symbol string, qty float64) (string, error) {
-	truncated := float64(int(qty*100000)) / 100000
+func (c *Client) MarketSell(symbol string, qty float64, precision int) (string, error) {
+	factor := math.Pow10(precision)
+	truncated := math.Trunc(qty*factor) / factor
 	if truncated <= 0 {
 		return "", fmt.Errorf("sell qty too small after truncation: %.8f", qty)
 	}
+	format := fmt.Sprintf("%%.%df", precision)
 	return c.placeOrder(map[string]string{
 		"category":  "spot",
 		"symbol":    symbol,
 		"side":      "Sell",
 		"orderType": "Market",
-		"qty":       fmt.Sprintf("%.5f", truncated),
+		"qty":       fmt.Sprintf(format, truncated),
 	})
 }
 
