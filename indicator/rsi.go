@@ -15,9 +15,17 @@ func RSI(prices []float64, period int) float64 {
 	}
 	avgGain := gains / float64(period)
 	avgLoss := losses / float64(period)
+
+	if avgGain == 0 && avgLoss == 0 {
+		return 50
+	}
 	if avgLoss == 0 {
 		return 100
 	}
+	if avgGain == 0 {
+		return 0
+	}
+
 	rs := avgGain / avgLoss
 	return 100 - (100 / (1 + rs))
 }
