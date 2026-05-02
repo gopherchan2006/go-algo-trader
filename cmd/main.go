@@ -138,6 +138,7 @@ func main() {
 
 func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCount int, totalPnL float64, history []report.Trade) {
 	var prices []float64
+	var lastSellTime time.Time
 
 	ticker := time.NewTicker(strategy.PollEvery)
 	defer ticker.Stop()
@@ -172,15 +173,15 @@ func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCoun
 				unrealized = gross - fee
 			}
 
-			fmt.Fprintf(out, "[%s] price=%.4f  EMA%d=%.4f  EMA%d=%.4f  RSI=%.1f  BB[%.4f/%.4f]  pos=%v  unreal=%+.2f\n",
+			fmt.Fprintf(out, "[%s] price=%.4f  EMA%d=%.4f  EMA%d=%.4f  RSI=%.1f(prev=%.1f)  BB[%.4f/%.4f]  pos=%v  unreal=%+.2f\n",
 				now.Format("15:04:05"), price,
 				strategy.EMAFastPeriod, ind.EMAFast,
 				strategy.EMASlowPeriod, ind.EMASlow,
-				ind.RSI,
+				ind.RSI, ind.PrevRSI,
 				ind.BB.Lower, ind.BB.Upper,
 				pos.active, unrealized)
 
-			sig := strategy.Evaluate(ind, pos.entryPrice, pos.active)
+			sig := strategy.Evaluate(ind, pos.entryPrice, pos.active, lastSellTime)
 
 			switch sig {
 			case strategy.SignalBuy:
@@ -254,7 +255,7 @@ func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCoun
 						gross, fee, feePct, net)
 					fmt.Fprintf(out, "       cumulative P&L: %+.2f USDT\n", totalPnL)
 					fmt.Fprintf(out, "       orderID=%s\n", orderID)
-
+					lastSellTime = now
 					pos = position{}
 				}
 			}
