@@ -13,6 +13,7 @@ import (
 	"github.com/gopherchan2006/go-algo-trader/bybit"
 	"github.com/gopherchan2006/go-algo-trader/report"
 	"github.com/gopherchan2006/go-algo-trader/strategy"
+	"github.com/gopherchan2006/go-triangle-detector/pkg/triangle"
 )
 
 var out io.Writer = os.Stdout
@@ -54,7 +55,6 @@ func main() {
 	startPrice, _ := client.GetLastPrice(strategy.Symbol)
 	btcAtStart, _ := client.GetCoinBalance(strategy.BaseCoin)
 
-	// Sell any leftover BTC from a previous crashed session
 	if btcAtStart > 0.0001 {
 		fmt.Fprintf(out, "[!] Found %.6f %s leftover from previous session — selling...\n", btcAtStart, strategy.BaseCoin)
 		_, sellErr := client.MarketSell(strategy.Symbol, btcAtStart, strategy.QtyDecimals)
@@ -75,11 +75,9 @@ func main() {
 	}
 
 	fmt.Fprintf(out, "\n╔════════════════════════════════════════════════╗\n")
-	fmt.Fprintf(out, "║  go-algo-trader  |  Volatility Hunter          ║\n")
+	fmt.Fprintf(out, "║  go-algo-trader  |  Ascending Triangle          ║\n")
 	fmt.Fprintf(out, "║  symbol=%-10s  risk=%.0f%%  run=24/7        ║\n", strategy.Symbol, strategy.RiskPct*100)
-	fmt.Fprintf(out, "║  RSI(%d)  BB(%d,%.0f)  EMA(%d/%d)                 ║\n",
-		strategy.RSIPeriod, strategy.BBPeriod, strategy.BBMult,
-		strategy.EMAFastPeriod, strategy.EMASlowPeriod)
+	fmt.Fprintf(out, "║  interval=%s  limit=%d                        ║\n", strategy.KlineInterval, strategy.KlineLimit)
 	fmt.Fprintf(out, "║  SL=%.0f%%  TP=%.0f%%                               ║\n",
 		strategy.StopLossPct*100, strategy.TakeProfitPct*100)
 	fmt.Fprintf(out, "╚════════════════════════════════════════════════╝\n")
@@ -137,7 +135,6 @@ func main() {
 }
 
 func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCount int, totalPnL float64, history []report.Trade) {
-	var prices []float64
 	var lastSellTime time.Time
 
 	ticker := time.NewTicker(strategy.PollEvery)
@@ -151,20 +148,14 @@ func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCoun
 		case <-ticker.C:
 			now := time.Now()
 
-			price, err := client.GetLastPrice(strategy.Symbol)
+			candles, err := client.GetKlines(strategy.Symbol, strategy.KlineInterval, strategy.KlineLimit)
 			if err != nil {
-				fmt.Fprintf(out, "[WARN] price fetch failed: %v\n", err)
-				continue
-			}
-			prices = append(prices, price)
-
-			if len(prices) < strategy.MinPrices {
-				fmt.Fprintf(out, "[%s] Warming up (%d/%d)  price=%.4f\n",
-					now.Format("15:04:05"), len(prices), strategy.MinPrices, price)
+				fmt.Fprintf(out, "[WARN] klines fetch failed: %v\n", err)
 				continue
 			}
 
-			ind := strategy.Compute(prices)
+			price := candles[len(candles)-1].Close
+			result := triangle.Detect(candles)
 
 			unrealized := 0.0
 			if pos.active && pos.qtyHeld > 0 {
@@ -173,22 +164,23 @@ func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCoun
 				unrealized = gross - fee
 			}
 
-			fmt.Fprintf(out, "[%s] price=%.4f  EMA%d=%.4f  EMA%d=%.4f  RSI=%.1f(prev=%.1f)  BB[%.4f/%.4f]  pos=%v  unreal=%+.2f\n",
+			fmt.Fprintf(out, "[%s] price=%.4f  found=%v  resistance=%.4f  touches=%d  reason=%s  pos=%v  unreal=%+.2f\n",
 				now.Format("15:04:05"), price,
-				strategy.EMAFastPeriod, ind.EMAFast,
-				strategy.EMASlowPeriod, ind.EMASlow,
-				ind.RSI, ind.PrevRSI,
-				ind.BB.Lower, ind.BB.Upper,
+				result.Found,
+				result.ResistanceLevel,
+				result.ResistanceTouches,
+				result.RejectReason,
 				pos.active, unrealized)
 
-			sig := strategy.Evaluate(ind, pos.entryPrice, pos.active, lastSellTime)
+			sig := strategy.Evaluate(result, price, pos.entryPrice, pos.active, lastSellTime)
 
 			switch sig {
 			case strategy.SignalBuy:
 				usdtBalance, _ := client.GetCoinBalance("USDT")
 				spend := usdtBalance * strategy.RiskPct
 				fmt.Fprintf(out, "  ┌─ BUY SIGNAL ─────────────────────────────────────────────\n")
-				fmt.Fprintf(out, "  │  RSI=%.1f  price=%.4f  BB_lower=%.4f\n", ind.RSI, price, ind.BB.Lower)
+				fmt.Fprintf(out, "  │  resistance=%.4f  touches=%d  price=%.4f\n",
+					result.ResistanceLevel, result.ResistanceTouches, price)
 				fmt.Fprintf(out, "  │  balance=%.2f USDT  spending=%.2f USDT\n", usdtBalance, spend)
 
 				coinBefore, _ := client.GetCoinBalance(strategy.BaseCoin)
@@ -210,7 +202,7 @@ func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCoun
 						entryTime:  now,
 						spentUSDT:  spend,
 					}
-					fmt.Fprintf(out, "  └─ ✓ BUY #%d  entry=%.4f  qty=%.2f %s  cost=%.2f USDT\n",
+					fmt.Fprintf(out, "  └─ ✓ BUY #%d  entry=%.4f  qty=%.6f %s  cost=%.2f USDT\n",
 						tradeCount, pos.entryPrice, pos.qtyHeld, strategy.BaseCoin, spend)
 					fmt.Fprintf(out, "       orderID=%s\n", orderID)
 				}
@@ -220,7 +212,7 @@ func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCoun
 					break
 				}
 				fmt.Fprintf(out, "  ┌─ %s ────────────────────────────────────────────────────\n", sig)
-				fmt.Fprintf(out, "  │  qty=%.2f %s  entry=%.4f  now=%.4f\n",
+				fmt.Fprintf(out, "  │  qty=%.6f %s  entry=%.4f  now=%.4f\n",
 					pos.qtyHeld, strategy.BaseCoin, pos.entryPrice, price)
 
 				orderID, err := client.MarketSell(strategy.Symbol, pos.qtyHeld, strategy.QtyDecimals)
@@ -258,10 +250,6 @@ func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCoun
 					lastSellTime = now
 					pos = position{}
 				}
-			}
-
-			if len(prices) > 200 {
-				prices = prices[len(prices)-200:]
 			}
 		}
 	}
