@@ -50,8 +50,28 @@ func main() {
 	if err != nil {
 		log.Fatalf("get balance: %v", err)
 	}
-	if startUSDT < 10 {
-		log.Fatalf("USDT balance too low: %.2f", startUSDT)
+
+	startPrice, _ := client.GetLastPrice(strategy.Symbol)
+	btcAtStart, _ := client.GetCoinBalance(strategy.BaseCoin)
+
+	// Sell any leftover BTC from a previous crashed session
+	if btcAtStart > 0.0001 {
+		fmt.Fprintf(out, "[!] Found %.6f %s leftover from previous session — selling...\n", btcAtStart, strategy.BaseCoin)
+		_, sellErr := client.MarketSell(strategy.Symbol, btcAtStart, strategy.QtyDecimals)
+		if sellErr != nil {
+			fmt.Fprintf(out, "[WARN] Could not sell leftover %s: %v\n", strategy.BaseCoin, sellErr)
+		} else {
+			time.Sleep(2 * time.Second)
+			startUSDT, _ = client.GetCoinBalance("USDT")
+			btcAtStart = 0
+			startPrice, _ = client.GetLastPrice(strategy.Symbol)
+			fmt.Fprintf(out, "[!] Sold leftover %s. USDT balance now: %.2f\n", strategy.BaseCoin, startUSDT)
+		}
+	}
+
+	startTotal := startUSDT + btcAtStart*startPrice
+	if startTotal < 10 {
+		log.Fatalf("portfolio balance too low: %.2f USDT", startTotal)
 	}
 
 	fmt.Fprintf(out, "\n╔════════════════════════════════════════════════╗\n")
@@ -63,7 +83,7 @@ func main() {
 	fmt.Fprintf(out, "║  SL=%.0f%%  TP=%.0f%%                               ║\n",
 		strategy.StopLossPct*100, strategy.TakeProfitPct*100)
 	fmt.Fprintf(out, "╚════════════════════════════════════════════════╝\n")
-	fmt.Fprintf(out, "  Starting balance: %.2f USDT\n\n", startUSDT)
+	fmt.Fprintf(out, "  Starting portfolio: %.2f USDT\n\n", startTotal)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -110,7 +130,10 @@ func main() {
 
 	time.Sleep(2 * time.Second)
 	endUSDT, _ := client.GetCoinBalance("USDT")
-	report.PrintSummary(out, startUSDT, endUSDT, totalPnL, tradeCount, history)
+	endPrice, _ := client.GetLastPrice(strategy.Symbol)
+	btcAtEnd, _ := client.GetCoinBalance(strategy.BaseCoin)
+	endTotal := endUSDT + btcAtEnd*endPrice
+	report.PrintSummary(out, startTotal, endTotal, totalPnL, tradeCount, history)
 }
 
 func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCount int, totalPnL float64, history []report.Trade) {
@@ -242,4 +265,3 @@ func runLoop(ctx context.Context, client *bybit.Client) (pos position, tradeCoun
 		}
 	}
 }
-

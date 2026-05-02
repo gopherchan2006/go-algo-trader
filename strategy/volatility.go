@@ -7,8 +7,8 @@ import (
 )
 
 const (
-	Symbol    = "XRPUSDT"
-	BaseCoin  = "XRP"
+	Symbol    = "BTCUSDT"
+	BaseCoin  = "BTC"
 	RiskPct   = 0.25
 	FeeRate   = 0.001
 	PollEvery = 15 * time.Second
@@ -27,7 +27,7 @@ const (
 	StopLossPct   = 0.02
 	TakeProfitPct = 0.05
 
-	QtyDecimals = 2
+	QtyDecimals = 6
 
 	MinPrices = 22
 )
@@ -83,12 +83,12 @@ func Evaluate(ind Indicators, entryPrice float64, inPosition bool) Signal {
 		if ind.Price >= entryPrice*(1+TakeProfitPct) {
 			return SignalTakeProfit
 		}
-		if ind.Price >= ind.BB.Upper && ind.RSI > RSIOverbought {
+		if ind.RSI > RSIOverbought {
 			return SignalSell
 		}
 		return SignalNone
 	}
-	if ind.Price <= ind.BB.Lower && ind.RSI < RSIOversold && ind.EMAFast > ind.EMASlow {
+	if ind.RSI < RSIOversold {
 		return SignalBuy
 	}
 	return SignalNone
