@@ -24,7 +24,7 @@ const (
 	EMAFastPeriod = 9
 	EMASlowPeriod = 21
 
-	StopLossPct   = 0.02
+	StopLossPct   = 0.05
 	TakeProfitPct = 0.05
 
 	QtyDecimals = 6
