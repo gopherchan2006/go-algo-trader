@@ -104,8 +104,8 @@ func Evaluate(ind Indicators, entryPrice float64, inPosition bool, lastSellTime 
 	if !lastSellTime.IsZero() && time.Since(lastSellTime) < CooldownAfterSell {
 		return SignalNone
 	}
-	// Покупать только когда RSI растёт (подтверждение разворота вверх)
-	if ind.RSI < RSIOversold && ind.RSI > ind.PrevRSI {
+	// Покупать когда RSI в зоне перепроданности (избегаем нулевого значения)
+	if ind.RSI < RSIOversold && ind.RSI > 0 {
 		return SignalBuy
 	}
 	return SignalNone
