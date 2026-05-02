@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/gopherchan2006/go-triangle-detector/pkg/triangle"
 )
 
 const (
@@ -106,6 +108,76 @@ func (c *Client) GetLastPrice(symbol string) (float64, error) {
 		return 0, fmt.Errorf("parse price: %w", err)
 	}
 	return price, nil
+}
+
+func (c *Client) GetKlines(symbol, interval string, limit int) ([]triangle.Candle, error) {
+	query := fmt.Sprintf("category=spot&symbol=%s&interval=%s&limit=%d", symbol, interval, limit)
+
+	body, err := c.get("/v5/market/kline", query)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		RetCode int    `json:"retCode"`
+		RetMsg  string `json:"retMsg"`
+		Result  struct {
+			List [][]string `json:"list"`
+		} `json:"result"`
+	}
+
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse klines: %w", err)
+	}
+	if resp.RetCode != 0 {
+		return nil, fmt.Errorf("bybit: %s", resp.RetMsg)
+	}
+
+	raw := resp.Result.List
+	candles := make([]triangle.Candle, len(raw))
+	for i, row := range raw {
+		if len(row) < 6 {
+			return nil, fmt.Errorf("kline row %d has %d fields", i, len(row))
+		}
+		tsMs, err := strconv.ParseInt(row[0], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse startTime[%d]: %w", i, err)
+		}
+		open, err := strconv.ParseFloat(row[1], 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse open[%d]: %w", i, err)
+		}
+		high, err := strconv.ParseFloat(row[2], 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse high[%d]: %w", i, err)
+		}
+		low, err := strconv.ParseFloat(row[3], 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse low[%d]: %w", i, err)
+		}
+		close, err := strconv.ParseFloat(row[4], 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse close[%d]: %w", i, err)
+		}
+		vol, err := strconv.ParseFloat(row[5], 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse volume[%d]: %w", i, err)
+		}
+		candles[i] = triangle.Candle{
+			Timestamp: time.Unix(tsMs/1000, 0).UTC(),
+			Open:      open,
+			High:      high,
+			Low:       low,
+			Close:     close,
+			Volume:    vol,
+		}
+	}
+
+	for left, right := 0, len(candles)-1; left < right; left, right = left+1, right-1 {
+		candles[left], candles[right] = candles[right], candles[left]
+	}
+
+	return candles, nil
 }
 
 func (c *Client) MarketBuy(symbol string, usdtAmount float64) (string, error) {
